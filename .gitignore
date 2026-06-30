@@ -1,0 +1,9 @@
+.env
+config.env
+airflow.db
+logs/
+log_reports/
+data/
+retail_product_incident_history_rag/
+__pycache__/
+*.pyc
