@@ -37,7 +37,7 @@ def get_conn():
     return psycopg2.connect(**get_db_config())
 
 
-# ---------- OS: CPU ----------
+#--------- OS: CPU ----------
 def collect_cpu():
     cpu_percent = psutil.cpu_percent(interval=1)
     per_core = psutil.cpu_percent(interval=1, percpu=True)
@@ -62,7 +62,8 @@ def collect_cpu():
 
 # ---------- OS: Memory ----------
 def detect_oom():
-    """cgroup v2 oom_kill counter first, fallback to dmesg."""
+    """ Detect if the system has experienced an Out Of Memory (OOM) event.
+    Returns a dictionary with keys: "oom_detected", "oom_count", "oom_source" """
     oom_count = 0
     source = None
     try:
@@ -101,8 +102,9 @@ def collect_memory():
         **oom,
     }
 
-
+#--------- Memory trend ----------
 def update_trend(ram_used_percent):
+    """ Update the trend file with the latest RAM usage percentage and return the trend direction. """
     sample = {"ts": datetime.utcnow().isoformat(), "ram_used_percent": ram_used_percent}
     history = []
     if TREND_FILE.exists():
@@ -123,6 +125,7 @@ def update_trend(ram_used_percent):
 
 # ---------- Postgres activity ----------
 def collect_postgres_activity():
+    """ Collect Postgres activity metrics: max connections, total connections, state counts, slow queries, waiting locks. """
     try:
         conn = get_conn()
         cur = conn.cursor()
@@ -185,8 +188,12 @@ def cpu_health(cpu):
 def memory_health(mem, trend):
     if mem["ram_used_percent"] > 90 or mem["swap_percent"] > 40 or mem["oom_detected"]:
         return "CRITICAL"
-    if mem["ram_used_percent"] > 75 or mem["swap_percent"] > 10 or trend["trend"] == "RISING":
+    if mem["ram_used_percent"] > 85:
         return "WARNING"
+    if mem["swap_percent"] > 10:
+        return "WARNING"
+    if trend["trend"] == "RISING":
+        return "MONITOR"
     return "HEALTHY"
 
 
@@ -219,7 +226,14 @@ def run():
         "postgres_health": postgres_health(pg),
     }
     healths = (result["cpu_health"], result["memory_health"], result["postgres_health"])
-    overall = "CRITICAL" if "CRITICAL" in healths else "WARNING" if "WARNING" in healths else "HEALTHY"
+    if "CRITICAL" in healths:
+        overall = "CRITICAL"
+    elif "WARNING" in healths:
+        overall = "WARNING"
+    elif "MONITOR" in healths:
+        overall = "MONITOR"
+    else:
+        overall = "HEALTHY"
     result["overall_health"] = overall
     log.info("CPU=%s MEM=%s PG=%s -> overall=%s", *healths, overall)
     return result
