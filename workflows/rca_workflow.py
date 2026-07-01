@@ -15,23 +15,21 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "rag"))
 sys.path.insert(0, str(PROJECT_ROOT / "agents"))
 
-# ── LangGraph ────────────────────────────────────────────────────────────────
+from langgraph import graph
 from langgraph.graph import StateGraph, END
 
-# ── State ────────────────────────────────────────────────────────────────────
 from core.state import RCAState
 
-# ── Agents ───────────────────────────────────────────────────────────────────
-from agents.airflow_agent       import run as airflow_run
-from agents.audit_agent         import run as audit_run
-from agents.postgres_agent      import run as postgres_run
-from agents.rag_agent           import run as rag_run
-from agents.cpu_agent           import run as cpu_run
-from agents.rca_agent           import run as rca_run
+from agents.airflow_agent import run as airflow_run
+from agents.audit_agent import run as audit_run
+from agents.postgres_agent import run as postgres_run
+from agents.rag_agent import run as rag_run
+from agents.cpu_agent import run as cpu_run
+from agents.pg_logs_agent import run as pg_logs_run
+from agents.rca_agent import run as rca_run
 from agents.teams_summary_agent import run as teams_summary_run
+from notifications.teams_publisher import publish_autorca_card_to_teams
 
-# ── Teams Publisher ──────────────────────────────────────────────────────────
-from teams_publisher import publish_autorca_card_to_teams
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +53,7 @@ def supervisor_node(state: RCAState) -> RCAState:
         "run_postgres"     : True,
         "run_rag"          : True,
         "run_cpu"          : True,
+        "run_pg_logs"      : True,
         "errors"           : [],
         "workflow_status"  : "RUNNING",
         "notification_sent": False,
@@ -63,6 +62,7 @@ def supervisor_node(state: RCAState) -> RCAState:
         "postgres_data"    : None,
         "rag_data"         : None,
         "cpu_data"         : None,
+        "pg_logs_data"     : None,
         "final_rca"        : None,
     }
 
@@ -72,27 +72,44 @@ def cpu_node(state: RCAState) -> RCAState:
     errors = list(state.get("errors", []))
     try:
         result = cpu_run()
-        log.info(
-            "  overall_health=%s | cpu=%s | mem=%s | pg=%s",
-            result.get("overall_health"), result.get("cpu_health"),
-            result.get("memory_health"), result.get("postgres_health"),
-        )
+        log.info("  overall_health=%s | cpu=%s | mem=%s | pg=%s",
+                 result.get("overall_health"), result.get("cpu_health"),
+                 result.get("memory_health"), result.get("postgres_health"))
         if result.get("status") == "ERROR":
             errors.append(f"cpu_agent: {result.get('message')}")
-        return {**state, "cpu_data": result, "errors": errors}
+        return {"cpu_data": result, "errors": errors}      # ← only own keys
     except Exception as e:
         msg = f"cpu_node crashed: {e}"
         log.error(msg, exc_info=True)
         errors.append(msg)
         return {
-            **state,
-            "cpu_data": {
-                "agent": "cpu_agent", "status": "ERROR", "message": msg,
-                "overall_health": "UNKNOWN",
-            },
+            "cpu_data": {"agent": "cpu_agent", "status": "ERROR",
+                         "message": msg, "overall_health": "UNKNOWN"},
             "errors": errors,
         }
 
+
+
+def pg_logs_node(state: RCAState) -> RCAState:
+    log.info("PG LOGS NODE: Collecting PostgreSQL runtime diagnostics")
+    errors = list(state.get("errors", []))
+    try:
+        result = pg_logs_run(dag_id=state["dag_id"], task_id=state["task_id"])
+        log.info("health=%s | slow_queries=%s | waiting_locks=%s",
+                 result.get("health"), result.get("slow_query_count"),
+                 len(result.get("lock_waits", [])))
+        if result.get("status") == "ERROR":
+            errors.append(f"pg_logs_agent: {result.get('message')}")
+        return {"pg_logs_data": result, "errors": errors}  # ← only own keys
+    except Exception as e:
+        msg = f"pg_logs_node crashed: {e}"
+        log.error(msg, exc_info=True)
+        errors.append(msg)
+        return {
+            "pg_logs_data": {"agent": "pg_logs_agent", "status": "ERROR",
+                             "health": "UNKNOWN", "message": msg},
+            "errors": errors,
+        }
 
 def airflow_node(state: RCAState) -> RCAState:
     log.info("AIRFLOW NODE: Collecting log evidence")
@@ -104,21 +121,20 @@ def airflow_node(state: RCAState) -> RCAState:
             run_id        =state.get("run_id", ""),
             execution_date=state.get("execution_date", ""),
         )
-        log.info("  error_type=%s | product_id=%s", result.get("error_type"), result.get("product_id"))
+        log.info("  error_type=%s | product_id=%s",
+                 result.get("error_type"), result.get("product_id"))
         if result.get("status") == "ERROR":
             errors.append(f"airflow_agent: {result.get('message')}")
-        return {**state, "airflow_data": result, "errors": errors}
+        return {"airflow_data": result, "errors": errors}  # ← only own keys
     except Exception as e:
         msg = f"airflow_node crashed: {e}"
         log.error(msg, exc_info=True)
         errors.append(msg)
         return {
-            **state,
-            "airflow_data": {
-                "agent": "airflow_agent", "status": "ERROR",
-                "dag_id": state["dag_id"], "task_id": state["task_id"],
-                "error_type": "Unknown", "product_id": None, "error_message": msg,
-            },
+            "airflow_data": {"agent": "airflow_agent", "status": "ERROR",
+                             "dag_id": state["dag_id"], "task_id": state["task_id"],
+                             "error_type": "Unknown", "product_id": None,
+                             "error_message": msg},
             "errors": errors,
         }
 
@@ -128,35 +144,39 @@ def audit_node(state: RCAState) -> RCAState:
     errors = list(state.get("errors", []))
     try:
         result = audit_run(dag_id=state["dag_id"], task_id=state["task_id"])
-        log.info("  audit_id=%s | status=%s", result.get("audit_id"), result.get("status"))
+        log.info("  audit_id=%s | status=%s",
+                 result.get("audit_id"), result.get("status"))
         if result.get("status") == "ERROR":
             errors.append(f"audit_agent: {result.get('message')}")
-        return {**state, "audit_data": result, "errors": errors}
+        return {"audit_data": result, "errors": errors}    # ← only own keys
     except Exception as e:
         msg = f"audit_node crashed: {e}"
         log.error(msg, exc_info=True)
         errors.append(msg)
-        return {**state, "audit_data": {"agent": "audit_agent", "status": "ERROR", "message": msg}, "errors": errors}
+        return {"audit_data": {"agent": "audit_agent", "status": "ERROR",
+                               "message": msg}, "errors": errors}
 
 
 def postgres_node(state: RCAState) -> RCAState:
     log.info("POSTGRES NODE: Investigating product in database")
-    errors     = list(state.get("errors", []))
+    errors = list(state.get("errors", []))
     airflow_ev = state.get("airflow_data") or {}
     product_id = airflow_ev.get("product_id")
     if not product_id:
         log.warning("  No product_id from Airflow Agent")
     try:
         result = postgres_run(product_id=product_id)
-        log.info("  product_id=%s | exists=%s | brand=%s", product_id, result.get("exists"), result.get("brand"))
+        log.info("  product_id=%s | exists=%s | brand=%s",
+                 product_id, result.get("exists"), result.get("brand"))
         if result.get("status") == "ERROR":
             errors.append(f"postgres_agent: {result.get('message')}")
-        return {**state, "postgres_data": result, "errors": errors}
+        return {"postgres_data": result, "errors": errors} # ← only own keys
     except Exception as e:
         msg = f"postgres_node crashed: {e}"
         log.error(msg, exc_info=True)
         errors.append(msg)
-        return {**state, "postgres_data": {"agent": "postgres_agent", "status": "ERROR", "message": msg}, "errors": errors}
+        return {"postgres_data": {"agent": "postgres_agent", "status": "ERROR",
+                                  "message": msg}, "errors": errors}
 
 
 def rag_node(state: RCAState) -> RCAState:
@@ -214,6 +234,7 @@ def rca_node(state: RCAState) -> RCAState:
         "incidents_found": 0, "incidents": [], "top_match": None, "benchmarks": {},
     }
     cpu_ev      = state.get("cpu_data") or {"agent": "cpu_agent", "status": "MISSING", "overall_health": "UNKNOWN"}
+    pg_logs_ev  = state.get("pg_logs_data") or {"agent": "pg_logs_agent", "status": "MISSING", "health": "UNKNOWN"}
     perf_data   = state.get("performance_data") or {}
     try:
         result = rca_run(
@@ -222,6 +243,7 @@ def rca_node(state: RCAState) -> RCAState:
             postgres_evidence =postgres_ev,
             rag_evidence      =rag_ev,
             cpu_evidence      =cpu_ev,
+            pg_logs_evidence  =pg_logs_ev,
             performance_data  =perf_data,
         )
         log.info("  RCA generated | incident_id=%s | confidence=%s", result.get("incident_id"), result.get("confidence_score"))
@@ -246,6 +268,7 @@ def teams_summary_node(state: RCAState) -> RCAState:
             postgres_evidence=state.get("postgres_data")    or {},
             rag_evidence     =state.get("rag_data")         or {},
             cpu_evidence     =state.get("cpu_data")         or {},
+            pg_logs_evidence =state.get("pg_logs_data")     or {},
             performance_data =state.get("performance_data") or {},
         )
         log.info("  teams_summary built for incident_id=%s", enriched_rca.get("incident_id"))
@@ -288,10 +311,15 @@ def should_notify(state: RCAState) -> Literal["teams_summary", "end"]:
     return "end"
 
 
+def join_node(state: RCAState) -> RCAState:
+    log.info("JOIN: all parallel evidence agents complete")
+    return state
+
 def build_workflow() -> StateGraph:
     graph = StateGraph(RCAState)
     graph.add_node("supervisor",    supervisor_node)
     graph.add_node("cpu",           cpu_node)
+    graph.add_node("pg_logs",       pg_logs_node)
     graph.add_node("airflow",       airflow_node)
     graph.add_node("audit",         audit_node)
     graph.add_node("postgres",      postgres_node)
@@ -299,13 +327,22 @@ def build_workflow() -> StateGraph:
     graph.add_node("rca",           rca_node)
     graph.add_node("teams_summary", teams_summary_node)
     graph.add_node("teams_notify",  teams_notify_node)
+    graph.add_node("join", join_node)
     graph.set_entry_point("supervisor")
     graph.add_edge("supervisor", "cpu")
-    graph.add_edge("cpu",        "airflow")
-    graph.add_edge("airflow",    "audit")
-    graph.add_edge("audit",      "postgres")
-    graph.add_edge("postgres",   "rag")
-    graph.add_edge("rag",        "rca")
+    graph.add_edge("supervisor", "pg_logs")
+    graph.add_edge("supervisor", "airflow")
+    graph.add_edge("supervisor", "audit")
+    graph.add_edge("supervisor", "postgres")
+
+    graph.add_edge("cpu",      "join")
+    graph.add_edge("pg_logs",  "join")
+    graph.add_edge("airflow",  "join")
+    graph.add_edge("audit",    "join")
+    graph.add_edge("postgres", "join")
+
+    graph.add_edge("join", "rag")
+    graph.add_edge("rag",  "rca")
     graph.add_conditional_edges("rca", should_notify, {"teams_summary": "teams_summary", "end": END})
     graph.add_edge("teams_summary", "teams_notify")
     graph.add_edge("teams_notify",  END)
@@ -320,6 +357,7 @@ def run_rca_workflow(
     performance_data: dict = None,
 ) -> dict:
     log.info("Starting RCA Workflow | dag=%s task=%s run_id=%s", dag_id, task_id, run_id)
+
     workflow = build_workflow()
     initial_state: RCAState = {
         "dag_id"           : dag_id,
@@ -332,11 +370,13 @@ def run_rca_workflow(
         "run_postgres"     : False,
         "run_rag"          : False,
         "run_cpu"          : False,
+        "run_pg_logs"      : False,
         "airflow_data"     : None,
         "audit_data"       : None,
         "postgres_data"    : None,
         "rag_data"         : None,
         "cpu_data"         : None,
+        "pg_logs_data"     : None,
         "final_rca"        : None,
         "notification_sent": False,
         "errors"           : [],
