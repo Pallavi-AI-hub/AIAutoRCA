@@ -171,7 +171,7 @@ def _build_performance_summary(
     return "\n".join(lines) if lines else "No performance data available"
 
 
-def _build_system_health_summary(cpu_evidence: dict) -> str:
+def _build_system_health_summary(cpu_evidence: dict, pg_logs_evidence: dict = None) -> str:
     """
     Build a one-line system health summary from cpu_agent output for the Teams card.
     """
@@ -181,7 +181,9 @@ def _build_system_health_summary(cpu_evidence: dict) -> str:
     cpu    = cpu_evidence.get("cpu", {}) or {}
     mem    = cpu_evidence.get("memory", {}) or {}
     pg_act = cpu_evidence.get("postgres_activity", {}) or {}
-
+    runtime = pg_logs_evidence or {}
+    runtime_health = runtime.get("health", runtime.get("status", "Unknown"))
+    db = runtime.get("database_stats", {})
     oom_note = ", OOM detected" if mem.get("oom_detected") else ""
 
     lines = [
@@ -191,6 +193,10 @@ def _build_system_health_summary(cpu_evidence: dict) -> str:
         f"({pg_act.get('total_connections', 'N/A')}/{pg_act.get('max_connections', 'N/A')} conns, "
         f"{pg_act.get('waiting_locks', 0)} waiting locks)",
         f"Overall: {cpu_evidence.get('overall_health')}",
+        f"PostgreSQL Runtime: {runtime_health} "
+        f"(Active Queries={len(runtime.get('active_queries', []))}, "
+        f"Slow Queries={runtime.get('slow_query_count', 0)}, "
+        f"Waiting Locks={runtime.get('lock_summary', {}).get('waiting_locks_total', len(runtime.get('lock_waits', [])))}, "
     ]
     return " | ".join(lines)
 
@@ -202,6 +208,7 @@ def run(
     postgres_evidence: dict,
     rag_evidence     : dict,
     cpu_evidence     : dict = None,
+    pg_logs_evidence : dict = None,
     performance_data : dict = None,
 ) -> dict:
     log.info("TeamsSummaryAgent building teams_summary")
@@ -223,6 +230,7 @@ def run(
 
     perf_data = performance_data or {}
     cpu_ev    = cpu_evidence or {}
+    pg_logs_ev = pg_logs_evidence or {}
 
     # PostgreSQL check — give SLA-aware message instead of generic "not found"
     product_name = postgres_evidence.get("product_name")
@@ -258,7 +266,7 @@ def run(
     prev_act1, prev_act2, prev_act3                = _extract_preventive_steps(preventive)
     sla_summary                                    = _extract_sla_summary(sla_analysis)
     perf_summary                                   = _build_performance_summary(performance_insights, perf_data)
-    system_health_summary                          = _build_system_health_summary(cpu_ev)
+    system_health_summary                          = _build_system_health_summary(cpu_ev, pg_logs_ev)
 
     teams_summary = {
         "incident_id"            : _safe(incident_id),
@@ -363,6 +371,16 @@ if __name__ == "__main__":
             "postgres_activity": {"total_connections": 9, "max_connections": 100, "waiting_locks": 0},
             "postgres_health": "HEALTHY",
             "overall_health": "HEALTHY",
+        },
+        pg_logs_evidence={
+        "status":"SUCCESS",
+        "health":"HEALTHY",
+        "slow_query_count":0,
+        "lock_waits":[],
+        "database_stats":{
+        "deadlocks":0,
+        "buffer_hit_ratio_pct":99.4
+            }
         },
         performance_data={
             "total_rows": 1000000, "rows_inserted": 510000,
