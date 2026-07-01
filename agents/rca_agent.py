@@ -240,6 +240,7 @@ def compute_confidence(
     rag_ev      : dict,
     cpu_ev      : dict,
     perf_data   : dict,
+    pg_logs_ev  : dict,
 ) -> float:
     score = 0.0
 
@@ -276,6 +277,13 @@ def compute_confidence(
 
     if perf_data.get("rows_inserted") and perf_data.get("total_rows"):
         score += 0.05
+        
+    if pg_logs_ev.get("status") == "SUCCESS":
+        score += 0.05
+        if pg_logs_ev.get("database_stats"):
+            score += 0.05
+        if pg_logs_ev.get("health") in ("WARNING", "CRITICAL"):
+            score += 0.05
 
     return round(min(score, 1.0), 2)
 
@@ -306,12 +314,13 @@ def _calculate_performance_gap(current_rps: float, historical_avg_rps: float) ->
 # ══════════════════════════════════════════════════════════════════════════════
 # SYSTEM HEALTH BLOCK FORMATTER (CPU AGENT)
 # ══════════════════════════════════════════════════════════════════════════════
-def _format_system_health_block(cpu_ev: dict) -> str:
+def _format_system_health_block(cpu_ev: dict, pg_logs_ev: dict) -> str:
     if not cpu_ev or cpu_ev.get("status") != "SUCCESS":
         return "  System health check unavailable or not run (cpu_agent did not return SUCCESS)."
 
     cpu    = cpu_ev.get("cpu", {}) or {}
     mem    = cpu_ev.get("memory", {}) or {}
+    pg_stats = pg_logs_ev.get("database_stats", {}) if pg_logs_ev else {}
     trend  = cpu_ev.get("memory_trend", {}) or {}
     pg_act = cpu_ev.get("postgres_activity", {}) or {}
 
@@ -334,6 +343,24 @@ Postgres Activity Health : {cpu_ev.get('postgres_health')}
   Slow Queries Over Thresh: {pg_act.get('slow_queries_over_threshold')}
   Waiting Locks           : {pg_act.get('waiting_locks')}
 
+================ PostgreSQL Runtime ================
+
+Health                 : {pg_logs_ev.get('health')}
+
+Active Queries         : {len(pg_logs_ev.get('active_queries', []))}
+Slow Queries           : {pg_logs_ev.get('slow_query_count')}
+Waiting Locks          : {len(pg_logs_ev.get('lock_waits', []))}
+Deadlocks              : {pg_stats.get('deadlocks')}
+Buffer Hit Ratio       : {pg_stats.get('buffer_hit_ratio_pct')}%
+
+Backends               : {pg_stats.get('numbackends')}
+Commits                : {pg_stats.get('xact_commit')}
+Rollbacks              : {pg_stats.get('xact_rollback')}
+Temp Files             : {pg_stats.get('temp_files')}
+Conflicts              : {pg_stats.get('conflicts')}
+
+Issues                 : {", ".join(pg_logs_ev.get("issues", [])) if pg_logs_ev.get("issues") else "None"}
+
 Overall Infra Health     : {cpu_ev.get('overall_health')}
 """.strip()
 
@@ -347,6 +374,7 @@ def build_evidence_block(
     postgres_ev: dict,
     rag_ev     : dict,
     cpu_ev     : dict,
+    pg_logs_ev : dict,
     perf_data  : dict,
 ) -> str:
     incidents  = rag_ev.get("incidents", [])
@@ -447,7 +475,7 @@ Batch/Chunk Size  : {chunk_size}
 Insert Method     : {insert_method}
 """
 
-    system_health_block = _format_system_health_block(cpu_ev)
+    system_health_block = _format_system_health_block(cpu_ev, pg_logs_ev)
 
     return f"""
 === EVIDENCE PACKAGE FOR RCA ===
@@ -623,24 +651,26 @@ def run(
     postgres_evidence: dict,
     rag_evidence     : dict,
     cpu_evidence     : dict = None,
+    pg_logs_evidence : dict = None,
     performance_data : dict = None,
 ) -> dict:
     log.info("RCAAgent starting")
     try:
         perf_data = performance_data or {}
         cpu_ev    = cpu_evidence or {"agent": "cpu_agent", "status": "MISSING", "overall_health": "UNKNOWN"}
+        pg_logs_ev = pg_logs_evidence or {"agent": "pg_logs_agent", "status": "MISSING", "health": "UNKNOWN"}
 
         confidence = compute_confidence(
             airflow_evidence, audit_evidence,
             postgres_evidence, rag_evidence,
-            cpu_ev, perf_data,
+            cpu_ev,pg_logs_ev, perf_data,
         )
         log.info("Computed confidence score: %.2f", confidence)
 
         evidence_text = build_evidence_block(
             airflow_evidence, audit_evidence,
             postgres_evidence, rag_evidence,
-            cpu_ev, perf_data,
+            cpu_ev,pg_logs_ev, perf_data,
         )
 
         llm_response = call_llm(evidence_text)
@@ -757,6 +787,23 @@ if __name__ == "__main__":
             "postgres_health": "WARNING",
             "overall_health": "CRITICAL",
         },
+        pg_logs_evidence={
+        "agent": "pg_logs_agent",
+        "status": "SUCCESS",
+        "health": "CRITICAL",
+        "slow_query_count": 3,
+        "lock_waits": [{"pid": 1234, "lock_type": "ExclusiveLock", "query": "UPDATE product_details_master ..."}],
+        "active_queries": [{"query": "INSERT INTO product_details_master ..."}],
+        "database_stats": {
+        "deadlocks": 1,
+        "buffer_hit_ratio_pct": 94.8,
+        "numbackends": 24,
+        "xact_commit": 10234,
+        "xact_rollback": 21,
+        "temp_files": 3,
+        "conflicts": 0
+        },
+    },
         performance_data={
             "dag_id"          : "Daily_product_1Mdata_ETL_job",
             "task_id"         : "load_1m_data",
