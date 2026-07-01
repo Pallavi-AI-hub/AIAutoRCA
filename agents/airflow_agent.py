@@ -12,6 +12,7 @@ import re
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
+import json
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +24,36 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
 
 LOGS_PATH = Path(os.getenv("AIRFLOW_LOGS_PATH", str(PROJECT_ROOT / "logs")))
+
+
+def parse_json_log(raw_content: str) -> str:
+    """
+    Airflow 2.7+ writes logs as newline-delimited JSON.
+    Extract the 'event' field from each line so regex patterns
+    can match against plain text instead of JSON structure.
+    Falls back to raw content for plain-text log files.
+    """
+    lines = raw_content.strip().splitlines()
+    extracted = []
+    json_lines_found = 0
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            event = obj.get("event", "")
+            level = obj.get("level", "info").upper()
+            extracted.append(f"[{level}] {event}")
+            json_lines_found += 1
+        except (json.JSONDecodeError, ValueError):
+            extracted.append(line)
+
+    if json_lines_found > 0:
+        log.info("AirflowAgent: JSON log format detected — extracted %d event lines", json_lines_found)
+
+    return "\n".join(extracted)
 
 
 def get_log(dag_id: str, task_id: str, run_id: str) -> str:
@@ -53,7 +84,8 @@ def get_log(dag_id: str, task_id: str, run_id: str) -> str:
     log.info("Reading log: %s", latest)
 
     with open(latest, "r", errors="replace") as f:
-        return f.read()
+        raw_content = f.read()
+    return parse_json_log(raw_content)
 
 
 def extract_error(log_content: str) -> dict:
@@ -72,6 +104,10 @@ def extract_error(log_content: str) -> dict:
     error_map = {
         "SLA MISS DETECTED"         : "SLAMiss",
         "SLA breach"                : "SLAMiss",
+        "sla_missed=True"           : "SLAMiss",   
+        "SLA MISSED"                : "SLAMiss",   
+        "did not complete within"   : "SLAMiss",  
+        "SLA threshold"             : "SLAMiss",
         "UniqueViolation"           : "UniqueViolation",
         "duplicate key value"       : "UniqueViolation",
         "unique constraint"         : "UniqueViolation",
@@ -116,7 +152,7 @@ def extract_error(log_content: str) -> dict:
                 cleaned = line.strip()
                 if cleaned:
                     result["error_message"] = cleaned
-                    break
+                    break   
 
     for pattern in [
         r'Key \(product_id\)=\((\d+)\)',
