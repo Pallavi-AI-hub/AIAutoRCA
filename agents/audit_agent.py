@@ -13,17 +13,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def get_db_config():
     return {
-        "host": os.getenv("DB_HOST", "localhost"),
-        "database": os.getenv("DB_NAME", "retail_db"),
-        "user": os.getenv("DB_USER", "airflow_user"),
-        "password": os.getenv("DB_PASSWORD", "airflow123"),
+        "host": os.getenv("DB_HOST", "DB_HOST"),
+        "database": os.getenv("DB_NAME", "DB_NAME"),
+        "user": os.getenv("DB_USER", "DB_USER"),
+        "password": os.getenv("DB_PASSWORD", "DB_PASSWORD"),
         "connect_timeout": 10,
     }
 
 def get_conn():
     return psycopg2.connect(**get_db_config())
 
-def run(dag_id="retail_product_etl", task_id="load_product_csv"):
+def run(dag_id=None, task_id=None):
+    if not dag_id or not task_id:
+        log.error("AuditAgent requires both dag_id and task_id parameters")
+        return {"agent": "audit_agent", "status": "ERROR", "message": "Missing dag_id or task_id"}
     log.info("AuditAgent querying for dag=%s task=%s", dag_id, task_id)
     try:
         conn = get_conn()
