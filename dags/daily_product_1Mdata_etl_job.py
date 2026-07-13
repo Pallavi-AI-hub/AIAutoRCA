@@ -12,15 +12,15 @@ from pathlib import Path
  
 logger = logging.getLogger(__name__)
  
-PROJECT_ROOT = Path("/home/mpallavi/RETAIL_AI_RCA")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "rag"))
 sys.path.insert(0, str(PROJECT_ROOT / "agents"))
  
 from workflows.rca_workflow import run_rca_workflow
  
-PRODUCT_FILE  = "/home/mpallavi/RETAIL_AI_RCA/data/retail_product_data_1M.csv"
-EXPORT_FILE   = "/home/mpallavi/RETAIL_AI_RCA/data/product_master_1M_export.csv"
+PRODUCT_FILE  = str(PROJECT_ROOT / "data" / "retail_product_data_1M.csv")
+EXPORT_FILE   = str(PROJECT_ROOT / "data" / "product_master_1M_export.csv")
 DB_CONFIG     = {"host": "localhost", "database": "retail_db", "user": "airflow_user", "password": "airflow123"}
 SLA_SECONDS   = 30
 _rca_launched = False
